@@ -1,5 +1,7 @@
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
+import { handleChatwootMessageUpdated } from '@api/extensions/chatwoot/message-edit-handler';
+import { extractReplyContextInfo, normalizeBaileysObject } from '@api/extensions/story-reply/normalize-baileys-object';
 import { ExtendedMessageKey } from '@api/integrations/channel/whatsapp/whatsapp.baileys.service';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
@@ -870,23 +872,27 @@ export class ChatwootService {
     }
 
     const replyToIds = await this.getReplyToIds(messageBody, instance);
+    const contentAttributes = this.buildContentAttributes(replyToIds);
 
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
+
+    const payload: any = {
+      content: content,
+      message_type: messageType,
+      attachments: attachments,
+      private: privateMessage || false,
+      source_id: sourceId,
+      source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
+    };
+
+    if (contentAttributes) {
+      payload.content_attributes = contentAttributes;
+    }
 
     const message = await client.messages.create({
       accountId: this.provider.accountId,
       conversationId: conversationId,
-      data: {
-        content: content,
-        message_type: messageType,
-        attachments: attachments,
-        private: privateMessage || false,
-        source_id: sourceId,
-        content_attributes: {
-          ...replyToIds,
-        },
-        source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
-      },
+      data: payload,
     });
 
     if (!message) {
@@ -1011,12 +1017,10 @@ export class ChatwootService {
 
     if (messageBody && instance) {
       const replyToIds = await this.getReplyToIds(messageBody, instance);
+      const contentAttributes = this.buildContentAttributes(replyToIds);
 
-      if (replyToIds.in_reply_to || replyToIds.in_reply_to_external_id) {
-        const content = JSON.stringify({
-          ...replyToIds,
-        });
-        data.append('content_attributes', content);
+      if (contentAttributes) {
+        data.append('content_attributes', JSON.stringify(contentAttributes));
       }
     }
 
@@ -1244,6 +1248,8 @@ export class ChatwootService {
         return null;
       }
 
+      const waInstance = this.waMonitor.waInstances[instance.instanceName];
+
       if (
         this.provider.reopenConversation === false &&
         body.event === 'conversation_status_changed' &&
@@ -1254,11 +1260,20 @@ export class ChatwootService {
         this.cache.delete(keyToDelete);
       }
 
-      if (
-        !body?.conversation ||
-        body.private ||
-        (body.event === 'message_updated' && !body.content_attributes?.deleted)
-      ) {
+      if (!body?.conversation || body.private) {
+        return { message: 'bot' };
+      }
+
+      if (body.event === 'message_updated' && !body.content_attributes?.deleted) {
+        const resolvedInstanceId = instance.instanceId ?? waInstance?.instanceId ?? waInstance?.instance?.id;
+        await handleChatwootMessageUpdated({
+          body,
+          instance,
+          prismaRepository: this.prismaRepository,
+          waInstance,
+          logger: this.logger,
+          resolvedInstanceId,
+        });
         return { message: 'bot' };
       }
 
@@ -1274,7 +1289,6 @@ export class ChatwootService {
         : body.content;
 
       const senderName = body?.conversation?.messages[0]?.sender?.available_name || body?.sender?.name;
-      const waInstance = this.waMonitor.waInstances[instance.instanceName];
 
       if (body.event === 'message_updated' && body.content_attributes?.deleted) {
         const message = await this.prismaRepository.message.findFirst({
@@ -1542,8 +1556,11 @@ export class ChatwootService {
     instance: InstanceDto,
   ) {
     const key = message.key as ExtendedMessageKey;
+    const waInstance = this.waMonitor.waInstances[instance.instanceName];
+    const resolvedInstanceId =
+      instance.instanceId ?? waInstance?.instanceId ?? waInstance?.instance?.id ?? message.instanceId;
 
-    if (!chatwootMessageIds.messageId || !key?.id) {
+    if (!chatwootMessageIds.messageId || !key?.id || !resolvedInstanceId) {
       return;
     }
 
@@ -1556,7 +1573,7 @@ export class ChatwootService {
         "chatwootInboxId" = ${chatwootMessageIds.inboxId},
         "chatwootContactInboxSourceId" = ${chatwootMessageIds.contactInboxSourceId},
         "chatwootIsRead" = ${chatwootMessageIds.isRead || false}
-      WHERE "instanceId" = ${instance.instanceId} 
+      WHERE "instanceId" = ${String(resolvedInstanceId)} 
       AND "key"->>'id' = ${key.id}
     `;
 
@@ -1566,10 +1583,17 @@ export class ChatwootService {
   }
 
   private async getMessageByKeyId(instance: InstanceDto, keyId: string): Promise<MessageModel> {
+    const waInstance = this.waMonitor.waInstances[instance.instanceName];
+    const resolvedInstanceId = instance.instanceId ?? waInstance?.instanceId ?? waInstance?.instance?.id ?? null;
+
+    if (!resolvedInstanceId) {
+      return null;
+    }
+
     // Use raw SQL query to avoid JSON path issues with Prisma
     const messages = await this.prismaRepository.$queryRaw`
       SELECT * FROM "Message" 
-      WHERE "instanceId" = ${instance.instanceId} 
+      WHERE "instanceId" = ${String(resolvedInstanceId)} 
       AND "key"->>'id' = ${keyId}
       LIMIT 1
     `;
@@ -1580,24 +1604,50 @@ export class ChatwootService {
   private async getReplyToIds(
     msg: any,
     instance: InstanceDto,
-  ): Promise<{ in_reply_to: string; in_reply_to_external_id: string }> {
-    let inReplyTo = null;
-    let inReplyToExternalId = null;
+  ): Promise<{ in_reply_to: string | null; in_reply_to_external_id: string | null; quotedMessage: any | null }> {
+    const { stanzaId, quotedMessage, quotedMessageRaw } = extractReplyContextInfo(msg);
 
-    if (msg) {
-      inReplyToExternalId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? msg.contextInfo?.stanzaId;
-      if (inReplyToExternalId) {
-        const message = await this.getMessageByKeyId(instance, inReplyToExternalId);
-        if (message?.chatwootMessageId) {
-          inReplyTo = message.chatwootMessageId;
-        }
+    let inReplyTo: string | null = null;
+    const inReplyToExternalId = stanzaId;
+
+    if (inReplyToExternalId) {
+      const message = await this.getMessageByKeyId(instance, inReplyToExternalId);
+      if (message?.chatwootMessageId) {
+        inReplyTo = message.chatwootMessageId.toString();
       }
     }
 
     return {
       in_reply_to: inReplyTo,
       in_reply_to_external_id: inReplyToExternalId,
+      quotedMessage: quotedMessage ?? (quotedMessageRaw ? normalizeBaileysObject(quotedMessageRaw) : null),
     };
+  }
+
+  private buildContentAttributes(replyContext: {
+    in_reply_to: string | null;
+    in_reply_to_external_id: string | null;
+    quotedMessage: any | null;
+  }): Record<string, any> | undefined {
+    if (!replyContext) {
+      return undefined;
+    }
+
+    const contentAttributes: Record<string, any> = {};
+
+    if (replyContext.in_reply_to) {
+      contentAttributes.in_reply_to = replyContext.in_reply_to;
+    }
+
+    if (replyContext.in_reply_to_external_id) {
+      contentAttributes.in_reply_to_external_id = replyContext.in_reply_to_external_id;
+    }
+
+    if (replyContext.quotedMessage !== null && replyContext.quotedMessage !== undefined) {
+      contentAttributes.quotedMessage = replyContext.quotedMessage;
+    }
+
+    return Object.keys(contentAttributes).length > 0 ? contentAttributes : undefined;
   }
 
   private async getQuotedMessage(msg: any, instance: InstanceDto): Promise<Quoted> {

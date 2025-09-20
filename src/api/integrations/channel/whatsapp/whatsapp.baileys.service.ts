@@ -52,6 +52,7 @@ import {
   StatusMessage,
   TypeButton,
 } from '@api/dto/sendMessage.dto';
+import { normalizeBaileysObject } from '@api/extensions/story-reply/normalize-baileys-object';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
@@ -4349,29 +4350,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private convertLongToNumber(obj: any): any {
-    if (obj === null || obj === undefined) {
-      return obj;
-    }
-
-    if (Long.isLong(obj)) {
-      return obj.toNumber();
-    }
-
-    if (Array.isArray(obj)) {
-      return obj.map((item) => this.convertLongToNumber(item));
-    }
-
-    if (typeof obj === 'object') {
-      const converted: any = {};
-      for (const key in obj) {
-        if (Object.prototype.hasOwnProperty.call(obj, key)) {
-          converted[key] = this.convertLongToNumber(obj[key]);
-        }
-      }
-      return converted;
-    }
-
-    return obj;
+    return normalizeBaileysObject(obj);
   }
 
   private prepareMessage(message: proto.IWebMessageInfo): any {
